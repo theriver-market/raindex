@@ -7,10 +7,12 @@ use async_trait::async_trait;
 use raindex_app_settings::local_db_manifest::DB_SCHEMA_VERSION;
 use rusqlite::{types::ValueRef, Connection};
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::spawn_blocking;
 
 /// Pool of idle SQLite connections, each already set up with WAL journal mode,
@@ -18,10 +20,18 @@ use tokio::task::spawn_blocking;
 /// paying the full `open_connection` setup cost on every query, which matters
 /// for bursts of concurrent order lookups.
 type ConnectionPool = Arc<Mutex<Vec<Connection>>>;
+type WriteGate = Arc<AsyncMutex<()>>;
+
+/// SQLite permits concurrent readers in WAL mode, but still permits only one
+/// writer. Keep one asynchronous writer gate per database path so independent
+/// executors (including overlapping client instances during a config reload)
+/// cannot race their write transactions inside this process.
+static WRITE_GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>> = OnceLock::new();
 
 pub struct RusqliteExecutor {
     db_path: PathBuf,
     pool: ConnectionPool,
+    write_gate: WriteGate,
 }
 
 fn sqlvalue_to_rusqlite(v: SqlValue) -> rusqlite::types::Value {
@@ -38,8 +48,10 @@ fn sqlvalue_to_rusqlite(v: SqlValue) -> rusqlite::types::Value {
 
 impl RusqliteExecutor {
     pub fn new<P: AsRef<Path>>(db_path: P) -> Self {
+        let db_path = db_path.as_ref().to_path_buf();
         Self {
-            db_path: db_path.as_ref().to_path_buf(),
+            write_gate: write_gate_for(&db_path),
+            db_path,
             pool: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -64,6 +76,41 @@ impl RusqliteExecutor {
                 .map_err(|e| LocalDbQueryError::database(format!("SQL execution failed: {e}")))?;
         }
         Ok(())
+    }
+}
+
+fn write_gate_for(db_path: &Path) -> WriteGate {
+    let key = write_gate_key(db_path);
+    let gates = WRITE_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut gates = gates.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+        return gate;
+    }
+
+    let gate = Arc::new(AsyncMutex::new(()));
+    gates.insert(key, Arc::downgrade(&gate));
+    gate
+}
+
+fn write_gate_key(db_path: &Path) -> PathBuf {
+    if let Ok(path) = std::fs::canonicalize(db_path) {
+        return path;
+    }
+
+    let absolute = if db_path.is_absolute() {
+        db_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(db_path))
+            .unwrap_or_else(|_| db_path.to_path_buf())
+    };
+
+    match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(file_name)) => std::fs::canonicalize(parent)
+            .map(|parent| parent.join(file_name))
+            .unwrap_or(absolute),
+        _ => absolute,
     }
 }
 
@@ -158,8 +205,10 @@ impl LocalDbQueryExecutor for RusqliteExecutor {
 
         let db_path = self.db_path.clone();
         let pool = self.pool.clone();
+        let write_guard = Arc::clone(&self.write_gate).lock_owned().await;
         let batch = batch.clone();
         spawn_blocking(move || {
+            let _write_guard = write_guard;
             let conn = checkout(&pool, &db_path)?;
             for stmt in &batch {
                 if let Err(err) = RusqliteExecutor::invoke_statement(&conn, stmt) {
@@ -177,8 +226,10 @@ impl LocalDbQueryExecutor for RusqliteExecutor {
     async fn query_text(&self, stmt: &SqlStatement) -> Result<String, LocalDbQueryError> {
         let db_path = self.db_path.clone();
         let pool = self.pool.clone();
+        let write_guard = Arc::clone(&self.write_gate).lock_owned().await;
         let stmt = stmt.clone();
         spawn_blocking(move || {
+            let _write_guard = write_guard;
             let conn = checkout(&pool, &db_path)?;
             RusqliteExecutor::invoke_statement(&conn, &stmt)?;
             release(&pool, conn);
@@ -259,7 +310,9 @@ impl LocalDbQueryExecutor for RusqliteExecutor {
     async fn wipe_and_recreate(&self) -> Result<(), LocalDbQueryError> {
         let db_path = self.db_path.clone();
         let pool = Arc::clone(&self.pool);
+        let write_guard = Arc::clone(&self.write_gate).lock_owned().await;
         spawn_blocking(move || {
+            let _write_guard = write_guard;
             pool.lock().unwrap_or_else(|e| e.into_inner()).clear();
 
             for path in sqlite_file_paths(&db_path) {
@@ -297,6 +350,40 @@ mod tests {
     use super::*;
     use crate::local_db::query::create_tables::{create_tables_batch, create_tables_sql};
     use tempfile::TempDir;
+
+    #[test]
+    fn executors_for_same_database_share_write_gate() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("shared-write-gate.db");
+        let first = RusqliteExecutor::new(&db_path);
+        let second = RusqliteExecutor::new(&db_path);
+
+        assert!(Arc::ptr_eq(&first.write_gate, &second.write_gate));
+    }
+
+    #[tokio::test]
+    async fn write_operations_wait_for_shared_database_gate() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("serialized-writes.db");
+        let first = RusqliteExecutor::new(&db_path);
+        let second = RusqliteExecutor::new(&db_path);
+        let guard = Arc::clone(&first.write_gate).lock_owned().await;
+
+        let statement = SqlStatement::new("CREATE TABLE serialized_write (id INTEGER);");
+        let mut pending_write = Box::pin(second.query_text(&statement));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), pending_write.as_mut())
+                .await
+                .is_err(),
+            "a second executor must wait while the database write gate is held"
+        );
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(5), pending_write)
+            .await
+            .expect("write should resume after the gate is released")
+            .expect("write should succeed");
+    }
 
     #[test]
     fn empty_db_passes_schema_guard() {
