@@ -256,6 +256,29 @@ impl RaindexClient {
         request: TakeOrdersRequest,
         injector: &dyn SignedContextInjector,
     ) -> Result<TakeOrdersCalldataResult, RaindexError> {
+        self.get_take_orders_calldata_impl(request, injector, false)
+            .await
+    }
+
+    /// The River fork: build take-orders calldata for an executor contract
+    /// that pulls funds from the user itself (e.g. RiverTaker). Skips the
+    /// taker's approval check and the preflight simulation from the taker,
+    /// because the taker here is not the address that will call takeOrders;
+    /// the caller MUST simulate the real transaction before it is signed.
+    pub async fn get_take_orders_calldata_unchecked(
+        &self,
+        request: TakeOrdersRequest,
+    ) -> Result<TakeOrdersCalldataResult, RaindexError> {
+        self.get_take_orders_calldata_impl(request, &NoopInjector, true)
+            .await
+    }
+
+    async fn get_take_orders_calldata_impl(
+        &self,
+        request: TakeOrdersRequest,
+        injector: &dyn SignedContextInjector,
+        unchecked: bool,
+    ) -> Result<TakeOrdersCalldataResult, RaindexError> {
         let span = info_span!(
             "get_take_orders_calldata",
             chain_id = request.chain_id,
@@ -351,6 +374,19 @@ impl RaindexClient {
         let mut skipped_raindexes_count = 0usize;
         let mut approval_checked_raindex = None;
         let max_iterations = remaining_candidates.len();
+        if unchecked {
+            info!(
+                result_type = "take_orders_unchecked",
+                orders_count,
+                candidates_count,
+                selected_raindex = %best_raindex,
+                selected_legs_count = built.sim.legs.len(),
+                block_number,
+                duration_ms = started_at.elapsed_ms(),
+                "take-orders calldata built without taker checks (executor path)"
+            );
+            return result::build_calldata_result(best_raindex, built, req.mode, req.price_cap);
+        }
         for iteration in 0..max_iterations {
             if approval_checked_raindex != Some(best_raindex) {
                 let approval_params = ApprovalCheckParams {
