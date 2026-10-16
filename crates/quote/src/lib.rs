@@ -8,6 +8,7 @@ pub mod rpc;
 
 pub mod injector;
 pub mod oracle;
+mod oracle_circuit;
 mod order_quotes;
 pub use injector::{NoopInjector, SignedContextInjector};
 pub use order_quotes::*;

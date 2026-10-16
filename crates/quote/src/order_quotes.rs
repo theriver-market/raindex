@@ -5,7 +5,7 @@ use crate::rpc::{with_rpc_timeout, RPC_ATTEMPT_TIMEOUT_MS};
 use crate::{
     error::Error,
     injector::SignedContextInjector,
-    oracle::{OracleBatchRequest, OracleClient, ORACLE_REQUEST_CONCURRENCY_LIMIT},
+    oracle::{OracleBatchRequest, OracleClient, OracleError, ORACLE_REQUEST_CONCURRENCY_LIMIT},
     quote::{BatchQuoteTarget, QuoteTarget},
     OrderQuoteValue,
 };
@@ -365,6 +365,9 @@ async fn get_order_quotes_inner(
         oracle_batch_request_count,
         "starting bounded batched quote oracle context fetches"
     );
+    // Pairs whose endpoint circuit is open: skipped without a request and
+    // reported as an oracle fetch failure like any other.
+    let mut circuit_open_skips = 0usize;
     let oracle_batch_results: Vec<Result<Vec<Result<SignedContextV1, String>>, String>> =
         if oracle_batch_requests.is_empty() {
             vec![]
@@ -374,7 +377,11 @@ async fn get_order_quotes_inner(
                     .fetch_signed_context_batches(oracle_batch_requests)
                     .await
                     .into_iter()
-                    .map(|result| {
+                    .zip(&oracle_batches)
+                    .map(|(result, batch)| {
+                        if matches!(result, Err(OracleError::CircuitOpen { .. })) {
+                            circuit_open_skips += batch.items.len();
+                        }
                         result
                             .map(|items| {
                                 items
@@ -419,6 +426,7 @@ async fn get_order_quotes_inner(
         oracle_request_count = oracle_fetch_count,
         oracle_success_count = oracle_fetch_count.saturating_sub(oracle_fetch_failure_count),
         oracle_failure_count = oracle_fetch_failure_count,
+        circuit_open_skips,
         oracle_endpoint_count = oracle_batch_request_count,
         oracle_batch_request_count,
         oracle_concurrency_limit = ORACLE_REQUEST_CONCURRENCY_LIMIT,
@@ -1353,6 +1361,76 @@ amount price: 2 3;
         let oracle_request_bodies = oracle_server.await.unwrap();
         assert_eq!(oracle_request_bodies, vec![expected_oracle_body]);
         rpc_server.await.unwrap();
+    }
+
+    /// An order naming a retired oracle URL (404 to every request) is skipped
+    /// once its circuit opens; it still answers "Oracle fetch failed" for its
+    /// pairs (so callers treat it as an unavailable oracle) while the other
+    /// orders keep quoting.
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn test_get_order_quotes_skips_dead_oracle_order_and_quotes_the_rest() {
+        let setup = setup_test().await;
+        let vault_id = B256::from(U256::from(1u64));
+        for token in [&setup.token1, &setup.token2] {
+            setup
+                .local_evm
+                .deposit(
+                    setup.owner,
+                    Address::from_str(&token.address.0).unwrap(),
+                    U256::from(10).pow(U256::from(66)),
+                    18,
+                    vault_id,
+                )
+                .await;
+        }
+        let order_bytes = create_order(&setup, create_dotrain_config(&setup)).await;
+        let vault1 = create_vault(vault_id, &setup, &setup.token1);
+        let vault2 = create_vault(vault_id, &setup, &setup.token2);
+        let inputs = vec![vault2.clone(), vault1.clone()];
+        let outputs = vec![vault2, vault1];
+
+        let dead_oracle = MockServer::start_async().await;
+        let dead_mock = dead_oracle
+            .mock_async(|when, then| {
+                when.method(POST).path("/context");
+                then.status(404);
+            })
+            .await;
+        let dead_order = with_oracle_url(
+            create_sg_order(&setup, order_bytes.clone(), inputs.clone(), outputs.clone()),
+            &dead_oracle.url("/context"),
+        );
+        let plain_order = create_sg_order(&setup, order_bytes, inputs, outputs);
+
+        let mut last = Vec::new();
+        for _ in 0..4 {
+            last = get_order_quotes(
+                vec![dead_order.clone(), plain_order.clone()],
+                None,
+                vec![setup.local_evm.url()],
+                None,
+                Address::ZERO,
+                &NoopInjector,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Each round sends the dead order's pairs as one batch request.
+        assert_eq!(dead_mock.hits_async().await, 3);
+        assert_eq!(
+            last.iter().map(|r| r.success).collect::<Vec<_>>(),
+            vec![false, false, true, true]
+        );
+        for response in &last[..2] {
+            let error = response.error.as_deref().unwrap();
+            assert!(
+                error.starts_with("Oracle fetch failed for pair (")
+                    && error.contains("Oracle circuit open"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[tokio::test]

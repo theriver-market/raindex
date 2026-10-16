@@ -17,6 +17,11 @@ use std::{
 use tokio::sync::Semaphore;
 use url::Url;
 
+use crate::oracle_circuit::{classify_status, CircuitOutcome, OracleCircuitBreaker};
+pub use crate::oracle_circuit::{
+    ORACLE_CIRCUIT_COOLDOWN, ORACLE_CIRCUIT_FAILURE_THRESHOLD, ORACLE_CIRCUIT_FAILURE_WINDOW,
+};
+
 /// Default maximum number of concurrent oracle HTTP requests per caller and
 /// oracle origin.
 ///
@@ -30,6 +35,14 @@ static ORACLE_HTTP_CLIENT: OnceCell<Client> = OnceCell::new();
 type OracleRequestSemaphores = Mutex<HashMap<String, Weak<Semaphore>>>;
 static ORACLE_REQUEST_SEMAPHORES: Lazy<Arc<OracleRequestSemaphores>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+/// Per-endpoint circuit state, shared by every client in the process like the
+/// request semaphores. Not used on WASM (no monotonic clock there).
+#[cfg(not(target_family = "wasm"))]
+static ORACLE_CIRCUIT_BREAKER: Lazy<Arc<OracleCircuitBreaker>> = Lazy::new(|| {
+    Arc::new(OracleCircuitBreaker::new(Arc::new(
+        crate::oracle_circuit::SystemClock,
+    )))
+});
 
 /// Validate that an oracle URL is safe to POST to.
 /// Only http and https schemes are allowed to prevent SSRF.
@@ -62,6 +75,16 @@ pub enum OracleError {
 
     #[error("Invalid oracle response: {0}")]
     InvalidResponse(String),
+
+    /// The endpoint answered HTTP 404/405/410 repeatedly, so the request was
+    /// not sent. One probe is let through every cooldown.
+    #[error(
+        "Oracle circuit open for {endpoint}: skipped after repeated HTTP 4xx responses, next probe in {retry_in_secs}s"
+    )]
+    CircuitOpen {
+        endpoint: String,
+        retry_in_secs: u64,
+    },
 }
 
 fn request_failed(endpoint: &str, source: reqwest::Error) -> OracleError {
@@ -136,6 +159,7 @@ pub(crate) struct OracleClient {
     client: Client,
     request_semaphores: Arc<OracleRequestSemaphores>,
     concurrency_limit: NonZeroUsize,
+    circuit_breaker: Option<Arc<OracleCircuitBreaker>>,
 }
 
 /// One batch oracle POST prepared for bounded execution.
@@ -177,7 +201,14 @@ impl OracleClient {
             client: client.clone(),
             request_semaphores: ORACLE_REQUEST_SEMAPHORES.clone(),
             concurrency_limit,
+            circuit_breaker: default_circuit_breaker(),
         })
+    }
+
+    #[cfg(all(test, not(target_family = "wasm")))]
+    fn with_circuit_breaker(mut self, breaker: Arc<OracleCircuitBreaker>) -> Self {
+        self.circuit_breaker = Some(breaker);
+        self
     }
 
     fn request_semaphore(&self, url: &Url) -> Arc<Semaphore> {
@@ -210,31 +241,66 @@ impl OracleClient {
         request.await
     }
 
+    /// POST `body` to `url` and decode the JSON response.
+    ///
+    /// The endpoint's circuit is checked first: an open circuit returns
+    /// [`OracleError::CircuitOpen`] without a request. Circuits are keyed by
+    /// the sanitized endpoint (no query or credentials), so strict and
+    /// `allowFailure` requests to one URL share a circuit.
     async fn fetch_json<T: DeserializeOwned>(
         &self,
         url: &Url,
         body: Vec<u8>,
+        allow_failure_batch: bool,
     ) -> Result<T, OracleError> {
         let endpoint = sanitized_endpoint(url);
-        self.with_request_permit(url, async {
-            let response = self
-                .client
-                .post(url.clone())
-                .header("Content-Type", "application/octet-stream")
-                .body(body)
-                .timeout(ORACLE_REQUEST_TIMEOUT)
-                .send()
-                .await
-                .map_err(|source| request_failed(&endpoint, source))?
-                .error_for_status()
-                .map_err(|source| request_failed(&endpoint, source))?;
+        let circuit_permit =
+            match &self.circuit_breaker {
+                Some(breaker) => Some(breaker.admit(&endpoint).map_err(|rejection| {
+                    OracleError::CircuitOpen {
+                        endpoint: endpoint.clone(),
+                        retry_in_secs: rejection.retry_in.as_secs(),
+                    }
+                })?),
+                None => None,
+            };
 
-            response
-                .json()
-                .await
-                .map_err(|source| request_failed(&endpoint, source))
-        })
-        .await
+        let (outcome, result) = self
+            .with_request_permit(url, async {
+                let response = match self
+                    .client
+                    .post(url.clone())
+                    .header("Content-Type", "application/octet-stream")
+                    .body(body)
+                    .timeout(ORACLE_REQUEST_TIMEOUT)
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(source) => {
+                        return (
+                            CircuitOutcome::Inconclusive,
+                            Err(request_failed(&endpoint, source)),
+                        )
+                    }
+                };
+                let outcome = classify_status(response.status(), allow_failure_batch);
+                let response = match response.error_for_status() {
+                    Ok(response) => response,
+                    Err(source) => return (outcome, Err(request_failed(&endpoint, source))),
+                };
+                let result = response
+                    .json()
+                    .await
+                    .map_err(|source| request_failed(&endpoint, source));
+                (outcome, result)
+            })
+            .await;
+
+        if let Some(permit) = circuit_permit {
+            permit.record(outcome);
+        }
+        result
     }
 
     /// Fetch signed context for one pair.
@@ -252,7 +318,7 @@ impl OracleClient {
         url: &Url,
         body: Vec<u8>,
     ) -> Result<SignedContextV1, OracleError> {
-        let response: Vec<OracleResponse> = self.fetch_json(url, body).await?;
+        let response: Vec<OracleResponse> = self.fetch_json(url, body, false).await?;
 
         let [response]: [OracleResponse; 1] =
             response
@@ -300,7 +366,7 @@ impl OracleClient {
         expected_count: usize,
     ) -> Result<Vec<SignedContextV1>, OracleError> {
         let url = validate_oracle_url(url)?;
-        let response: Vec<OracleResponse> = self.fetch_json(&url, body).await?;
+        let response: Vec<OracleResponse> = self.fetch_json(&url, body, false).await?;
 
         if response.len() != expected_count {
             return Err(OracleError::InvalidResponse(format!(
@@ -323,7 +389,7 @@ impl OracleClient {
     ) -> Result<Vec<OracleBatchItemResult>, OracleError> {
         let mut url = validate_oracle_url(url)?;
         url.query_pairs_mut().append_pair("allowFailure", "true");
-        let response: OracleBatchResponse = self.fetch_json(&url, body).await?;
+        let response: OracleBatchResponse = self.fetch_json(&url, body, true).await?;
         let response: Vec<OracleBatchItemResult> = match response {
             OracleBatchResponse::Envelope(items) => items
                 .into_iter()
@@ -346,6 +412,16 @@ impl OracleClient {
         }
         Ok(response)
     }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn default_circuit_breaker() -> Option<Arc<OracleCircuitBreaker>> {
+    Some(ORACLE_CIRCUIT_BREAKER.clone())
+}
+
+#[cfg(target_family = "wasm")]
+fn default_circuit_breaker() -> Option<Arc<OracleCircuitBreaker>> {
+    None
 }
 
 fn build_http_client() -> Result<Client, reqwest::Error> {
@@ -480,6 +556,8 @@ pub fn extract_oracle_url(order: &SgOrder) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_family = "wasm"))]
+    use crate::oracle_circuit::tests::FakeClock;
     use alloy::primitives::{address, FixedBytes};
     #[cfg(not(target_family = "wasm"))]
     use httpmock::{Method::POST, MockServer};
@@ -971,6 +1049,181 @@ mod tests {
             ORACLE_REQUEST_CONCURRENCY_LIMIT
         );
         assert_eq!(started.load(Ordering::SeqCst), REQUEST_COUNT);
+    }
+
+    /// Prod 15-16 Oct: order 0x878c4fc1 names the retired
+    /// st0x-oracle-server.fly.dev/context URL, which answers 404 to every
+    /// request; every quote refetched it (~2,400 404s a day). After three 404s
+    /// the endpoint must be skipped without a request.
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn test_dead_oracle_endpoint_is_skipped_after_three_404s() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/context");
+                then.status(404);
+            })
+            .await;
+        let url = server.url("/context");
+
+        let mut errors = Vec::new();
+        for _ in 0..6 {
+            errors.push(fetch_signed_context(&url, vec![]).await.unwrap_err());
+        }
+
+        assert_eq!(mock.hits_async().await, 3, "only three requests are sent");
+        assert!(errors[2].to_string().contains("404"));
+        for error in &errors[3..] {
+            assert!(
+                error.to_string().contains("Oracle circuit open"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn test_oracle_503_no_live_quote_never_opens_the_circuit() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/context/v7");
+                then.status(503).json_body(json!({
+                    "error": "no_live_quote",
+                    "detail": "No live quote for wtSGOV."
+                }));
+            })
+            .await;
+        let clock = FakeClock::new();
+        let client = OracleClient::new()
+            .unwrap()
+            .with_circuit_breaker(Arc::new(OracleCircuitBreaker::new(clock.clone())));
+        let url = server.url("/context/v7");
+
+        for _ in 0..10 {
+            let error = client.fetch_signed_context(&url, vec![]).await.unwrap_err();
+            assert!(
+                error.to_string().contains("503"),
+                "unexpected error: {error}"
+            );
+            clock.advance(Duration::from_secs(1));
+        }
+
+        assert_eq!(mock.hits_async().await, 10);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn test_allow_failure_no_live_quote_items_never_open_the_circuit() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/context/v7")
+                    .query_param("allowFailure", "true");
+                then.status(200).json_body(json!([{
+                    "status": "error",
+                    "body": {"error": "no_live_quote", "detail": "No live quote for wtSGOV."}
+                }]));
+            })
+            .await;
+        let client = OracleClient::new()
+            .unwrap()
+            .with_circuit_breaker(Arc::new(OracleCircuitBreaker::new(FakeClock::new())));
+
+        for _ in 0..5 {
+            let items = client
+                .fetch_signed_context_batch_allow_failure(&server.url("/context/v7"), vec![], 1)
+                .await
+                .unwrap();
+            assert_eq!(items[0].as_ref().unwrap_err().error, "no_live_quote");
+        }
+
+        assert_eq!(mock.hits_async().await, 5);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn test_strict_400_never_opens_but_allow_failure_400_does() {
+        let server = MockServer::start_async().await;
+        let strict = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/strict");
+                then.status(400);
+            })
+            .await;
+        let batch = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/batch")
+                    .query_param("allowFailure", "true");
+                then.status(400);
+            })
+            .await;
+        let client = OracleClient::new()
+            .unwrap()
+            .with_circuit_breaker(Arc::new(OracleCircuitBreaker::new(FakeClock::new())));
+
+        for _ in 0..5 {
+            client
+                .fetch_signed_context_batch(&server.url("/strict"), vec![], 1)
+                .await
+                .unwrap_err();
+            client
+                .fetch_signed_context_batch_allow_failure(&server.url("/batch"), vec![], 1)
+                .await
+                .unwrap_err();
+        }
+
+        assert_eq!(strict.hits_async().await, 5);
+        assert_eq!(batch.hits_async().await, 3);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn test_circuit_probe_closes_when_the_endpoint_comes_back() {
+        let server = MockServer::start_async().await;
+        let gone = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/context");
+                then.status(410);
+            })
+            .await;
+        let clock = FakeClock::new();
+        let client = OracleClient::new()
+            .unwrap()
+            .with_circuit_breaker(Arc::new(OracleCircuitBreaker::new(clock.clone())));
+        let url = server.url("/context");
+
+        for _ in 0..4 {
+            client.fetch_signed_context(&url, vec![]).await.unwrap_err();
+        }
+        assert_eq!(gone.hits_async().await, 3);
+        let error = client.fetch_signed_context(&url, vec![]).await.unwrap_err();
+        assert!(
+            matches!(&error, OracleError::CircuitOpen { endpoint, retry_in_secs }
+                if endpoint == &url && *retry_in_secs == ORACLE_CIRCUIT_COOLDOWN.as_secs()),
+            "unexpected error: {error}"
+        );
+
+        gone.delete_async().await;
+        let back = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/context");
+                then.status(200).json_body_obj(&vec![OracleResponse {
+                    signer: address!("0x1111111111111111111111111111111111111111"),
+                    context: vec![FixedBytes::with_last_byte(1)],
+                    signature: vec![0xaa].into(),
+                }]);
+            })
+            .await;
+        clock.advance(ORACLE_CIRCUIT_COOLDOWN);
+
+        for _ in 0..3 {
+            client.fetch_signed_context(&url, vec![]).await.unwrap();
+        }
+        assert_eq!(back.hits_async().await, 3);
     }
 
     #[test]
