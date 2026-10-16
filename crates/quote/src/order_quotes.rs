@@ -1390,16 +1390,20 @@ amount price: 2 3;
         let inputs = vec![vault2.clone(), vault1.clone()];
         let outputs = vec![vault2, vault1];
 
+        // get_order_quotes uses the process-wide breaker and httpmock reuses
+        // pooled servers (same host:port) across tests, so this path is unique
+        // to this test: no other test's circuit can already be open for it.
+        const DEAD_PATH: &str = "/test-get-order-quotes-skips-dead-oracle-order/context";
         let dead_oracle = MockServer::start_async().await;
         let dead_mock = dead_oracle
             .mock_async(|when, then| {
-                when.method(POST).path("/context");
+                when.method(POST).path(DEAD_PATH);
                 then.status(404);
             })
             .await;
         let dead_order = with_oracle_url(
             create_sg_order(&setup, order_bytes.clone(), inputs.clone(), outputs.clone()),
-            &dead_oracle.url("/context"),
+            &dead_oracle.url(DEAD_PATH),
         );
         let plain_order = create_sg_order(&setup, order_bytes, inputs, outputs);
 

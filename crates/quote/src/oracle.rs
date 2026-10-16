@@ -1055,17 +1055,22 @@ mod tests {
     /// st0x-oracle-server.fly.dev/context URL, which answers 404 to every
     /// request; every quote refetched it (~2,400 404s a day). After three 404s
     /// the endpoint must be skipped without a request.
+    ///
+    /// This goes through the process-wide breaker. httpmock reuses pooled
+    /// servers (same host:port) across tests, so the path is unique to this
+    /// test: a circuit it opens must not match another test's URL.
     #[cfg(not(target_family = "wasm"))]
     #[tokio::test]
     async fn test_dead_oracle_endpoint_is_skipped_after_three_404s() {
+        const PATH: &str = "/test-dead-oracle-endpoint-is-skipped/context";
         let server = MockServer::start_async().await;
         let mock = server
             .mock_async(|when, then| {
-                when.method(POST).path("/context");
+                when.method(POST).path(PATH);
                 then.status(404);
             })
             .await;
-        let url = server.url("/context");
+        let url = server.url(PATH);
 
         let mut errors = Vec::new();
         for _ in 0..6 {
