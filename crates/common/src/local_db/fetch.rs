@@ -219,6 +219,13 @@ async fn fetch_block_timestamps(
     results.into_iter().collect()
 }
 
+/// A log's block timestamp counts only when non-zero: Robinhood Chain's RPC (4663) returns
+/// `"blockTimestamp": "0x0"` from `eth_getLogs` (its receipts carry the real time), and a
+/// zero stored as the event time dates the trade 1970.
+fn has_block_timestamp(event: &LogEntryResponse) -> bool {
+    event.block_timestamp.is_some_and(|t| !t.is_zero())
+}
+
 async fn backfill_missing_timestamps(
     rpc_client: &RpcClient,
     events: &mut [LogEntryResponse],
@@ -227,7 +234,7 @@ async fn backfill_missing_timestamps(
     let mut missing_blocks = HashSet::new();
 
     for event in events.iter() {
-        let has_timestamp = event.block_timestamp.as_ref().is_some();
+        let has_timestamp = has_block_timestamp(event);
 
         if !has_timestamp {
             missing_blocks.insert(event.block_number.to::<u64>());
@@ -242,7 +249,7 @@ async fn backfill_missing_timestamps(
     let timestamps = fetch_block_timestamps(rpc_client, block_numbers, config).await?;
 
     for event in events.iter_mut() {
-        let has_timestamp = event.block_timestamp.as_ref().is_some();
+        let has_timestamp = has_block_timestamp(event);
 
         if has_timestamp {
             continue;
@@ -741,6 +748,40 @@ mod tests {
 
             let mut events = vec![
                 make_log_entry_basic("0x1", None),
+                make_log_entry_basic("0x2", Some("0x20")),
+            ];
+
+            backfill_missing_timestamps(
+                &RpcClient::new_with_urls(vec![Url::parse(&server.url("/")).unwrap()]).unwrap(),
+                &mut events,
+                &FetchConfig::default(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(events[0].block_timestamp, Some(U256::from(0x10)));
+            assert_eq!(events[1].block_timestamp, Some(U256::from(0x20)));
+        }
+
+        #[tokio::test]
+        async fn backfill_missing_timestamps_replaces_zero_timestamps() {
+            // Robinhood Chain's eth_getLogs sends "blockTimestamp": "0x0".
+            let server = MockServer::start();
+
+            server.mock(|when, then| {
+                when.method(POST).path("/").json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_getBlockByNumber",
+                    "params": ["0x1", false]
+                }));
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(sample_block_response("0x1", Some("0x10")));
+            });
+
+            let mut events = vec![
+                make_log_entry_basic("0x1", Some("0x0")),
                 make_log_entry_basic("0x2", Some("0x20")),
             ];
 
